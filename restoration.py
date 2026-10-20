@@ -1,135 +1,169 @@
-"""Image degradation and restoration helpers (motion blur, Gaussian noise,
-inverse and Wiener filtering), all done in the 2-D DFT domain.
+"""Image degradation and restoration: motion blur, Gaussian noise,
+inverse filter and Wiener filter.
 
-Data model (circular convolution, so it is exact in the DFT domain):
-    g = h (*) f + n      <=>      G(u,v) = H(u,v) F(u,v) + N(u,v)
-f: original image, h: motion-blur PSF, n: i.i.d. Gaussian noise N(0, sigma^2),
-independent of f.
+Data model:   g = h * f + n      (in the DFT domain:  G = H F + N)
+  f : original image
+  h : motion-blur kernel (PSF), H = fft2(h)
+  n : white Gaussian noise with standard deviation sigma
+  g : degraded image
+The convolution is circular, so G = H F holds exactly for the DFT.
 """
 import numpy as np
 import scipy.io
 
 
-def load_images(path="img_restoration.mat"):
-    """Return the two test images as float64 arrays on the 0-255 scale."""
-    d = scipy.io.loadmat(path)
-    return {k: d[k].astype(np.float64) for k in ("I1", "I2")}
+def load_images(path):
+    """Load I1 and I2 from the .mat file as float arrays (values 0-255)."""
+    data = scipy.io.loadmat(path)
+    return {"I1": data["I1"].astype(float), "I2": data["I2"].astype(float)}
 
 
-# ---------------------------------------------------------------- degradation
+# ------------------------------------------------------------------
+# Degradation
+# ------------------------------------------------------------------
 
 def motion_psf(length, angle_deg, shape):
-    """Linear motion-blur PSF of `length` pixels at `angle_deg`, placed on a
-    grid of size `shape` with its centre at index (0, 0) (wrapped around), so
-    that fft2(psf) is the transfer function H without a phase shift.
-    Sums to 1 (blur preserves mean brightness)."""
-    M, N = shape
+    """Motion-blur kernel: a straight line of `length` pixels at `angle_deg`.
+
+    The kernel is stored in an array of the same size as the image, with
+    its centre at pixel (0, 0). Negative indices wrap around to the other
+    side of the array (Python does that automatically), so the line is
+    centred and the blur does not shift the image.
+    """
     psf = np.zeros(shape)
-    theta = np.deg2rad(angle_deg)
-    # Sample the line segment densely and accumulate into the nearest pixels.
-    t = np.linspace(-(length - 1) / 2, (length - 1) / 2, 20 * max(length, 1))
-    rows = np.round(-t * np.sin(theta)).astype(int) % M
-    cols = np.round(t * np.cos(theta)).astype(int) % N
-    np.add.at(psf, (rows, cols), 1.0)
-    return psf / psf.sum()
-
-
-def transfer_function(psf):
-    return np.fft.fft2(psf)
+    angle = np.deg2rad(angle_deg)
+    for k in range(length):
+        t = k - (length - 1) / 2               # position along the line
+        row = int(round(-t * np.sin(angle)))   # minus: rows go downwards
+        col = int(round(t * np.cos(angle)))
+        psf[row, col] += 1
+    return psf / psf.sum()                     # sum 1: keeps the brightness
 
 
 def blur(f, H):
-    """Circular convolution with the PSF, done as a product in the DFT domain."""
+    """Blur image f: multiply its spectrum by H."""
     return np.real(np.fft.ifft2(np.fft.fft2(f) * H))
 
 
 def add_noise(f, sigma, rng):
-    return f + rng.normal(0.0, sigma, f.shape)
+    """Add white Gaussian noise with standard deviation sigma."""
+    return f + sigma * rng.standard_normal(f.shape)
 
 
-# ---------------------------------------------------------------- restoration
+# ------------------------------------------------------------------
+# Restoration filters
+# ------------------------------------------------------------------
 
-def inverse_filter(g, H, eps=0.0):
-    """Inverse filter F_hat = G / H.  Frequencies where |H| <= eps are set to
-    zero (truncated / pseudo-inverse) to avoid dividing by ~0."""
+def inverse_filter(g, H, eps):
+    """Inverse filter: F_hat = G / H.
+
+    Where |H| <= eps we cannot divide safely (division by almost zero
+    blows up the noise), so those frequencies are set to zero.
+    """
     G = np.fft.fft2(g)
-    R = np.zeros_like(H)
-    keep = np.abs(H) > eps
-    R[keep] = 1.0 / H[keep]
-    return np.real(np.fft.ifft2(R * G))
+    F_hat = np.zeros_like(G)
+    ok = np.abs(H) > eps
+    F_hat[ok] = G[ok] / H[ok]
+    return np.real(np.fft.ifft2(F_hat))
 
 
 def wiener_filter(g, H, nsr):
-    """Wiener filter F_hat = H* / (|H|^2 + S_n/S_f) G.
+    """Wiener filter: F_hat = conj(H) / (|H|^2 + Sn/Sf) * G.
 
-    `nsr` is the noise-to-signal power ratio S_n(u,v)/S_f(u,v): either a scalar
-    (constant-K approximation) or an array of the image size (per frequency)."""
+    nsr = Sn/Sf is the noise-to-signal power ratio. It can be one number
+    (constant K) or an array with one value per frequency.
+    """
     G = np.fft.fft2(g)
-    R = np.conj(H) / (np.abs(H) ** 2 + nsr)
-    return np.real(np.fft.ifft2(R * G))
+    W = np.conj(H) / (np.abs(H) ** 2 + nsr)
+    return np.real(np.fft.ifft2(W * G))
 
 
-def oracle_nsr(f, sigma):
-    """Per-frequency NSR using the true image: S_f = |F|^2 / (MN) (periodogram)
-    and S_n = sigma^2 (white noise).  Upper bound on Wiener performance."""
+def true_nsr(f, sigma):
+    """Sn/Sf computed with the ORIGINAL image (only possible in a test).
+
+    Sf = |F|^2 / (M N)   (periodogram of the original image)
+    Sn = sigma^2         (white noise has a flat spectrum)
+    """
     Sf = np.abs(np.fft.fft2(f)) ** 2 / f.size
-    return sigma ** 2 / np.maximum(Sf, 1e-12)
+    Sf = np.maximum(Sf, 1e-10)                 # avoid division by zero
+    return sigma ** 2 / Sf
 
 
-# -------------------------------------------------------------------- metrics
+# ------------------------------------------------------------------
+# Estimating sigma and Sf from the degraded image only
+# ------------------------------------------------------------------
+
+def estimate_sigma(g):
+    """Estimate the noise standard deviation from the image itself.
+
+    d = (a - b - c + e) / 2 for every 2x2 block [[a, b], [c, e]].
+    Smooth image parts cancel in d, so d is mostly noise, with variance
+    sigma^2. We use the median instead of the mean because the median is
+    not disturbed by the few large values at edges in the image.
+    For Gaussian noise: median(|d|) = 0.6745 * sigma.
+    """
+    d = (g[:-1, :-1] - g[:-1, 1:] - g[1:, :-1] + g[1:, 1:]) / 2
+    return np.median(np.abs(d)) / 0.6745
+
+
+def frequency_radius(shape):
+    """Distance of every DFT bin to frequency 0, in cycles per pixel."""
+    u = np.fft.fftfreq(shape[0])
+    v = np.fft.fftfreq(shape[1])
+    U, V = np.meshgrid(u, v, indexing="ij")
+    return np.sqrt(U ** 2 + V ** 2)
+
+
+def periodogram(g):
+    """Periodogram |G|^2 / (M N) of the image (mean removed)."""
+    return np.abs(np.fft.fft2(g - g.mean())) ** 2 / g.size
+
+
+def smooth_periodogram(P, width=5):
+    """Average every periodogram value with its neighbours (width x width).
+
+    The raw periodogram is very noisy (its standard deviation is as large
+    as its mean). Averaging 25 neighbours lowers the variance about 25
+    times, at the cost of frequency resolution.
+    """
+    total = np.zeros_like(P)
+    half = width // 2
+    for di in range(-half, half + 1):
+        for dj in range(-half, half + 1):
+            total += np.roll(P, (di, dj), axis=(0, 1))
+    return total / width ** 2
+
+
+def estimate_Sf(g, H, sigma):
+    """Estimate the image spectrum Sf from the degraded image.
+
+    Model for natural images: Sf(rho) = A / rho^alpha (a power law).
+    Model for the degraded image: Sg = |H|^2 Sf + sigma^2,
+    so  Sf = (Sg - sigma^2) / |H|^2.
+    We compute that only at frequencies where it is reliable (|H| not too
+    small and Sg clearly above the noise level), then fit a straight line
+    log(Sf) = log(A) - alpha * log(rho).
+    """
+    rho = frequency_radius(g.shape)
+    Sg = smooth_periodogram(periodogram(g))
+    H2 = np.abs(H) ** 2
+
+    good = (rho > 0) & (H2 > 0.1) & (Sg > 2 * sigma ** 2)
+    Sf_points = (Sg[good] - sigma ** 2) / H2[good]
+    slope, intercept = np.polyfit(np.log(rho[good]), np.log(Sf_points), 1)
+    alpha, A = -slope, np.exp(intercept)
+
+    rho_safe = np.maximum(rho, rho[good].min())  # avoid 1/0 at rho = 0
+    return A / rho_safe ** alpha, alpha
+
+
+# ------------------------------------------------------------------
+# Quality metrics
+# ------------------------------------------------------------------
 
 def mse(f, f_hat):
     return np.mean((f - f_hat) ** 2)
 
 
-def psnr(f, f_hat, peak=255.0):
-    return 10 * np.log10(peak ** 2 / mse(f, f_hat))
-
-
-# ------------------------------------------------- blind parameter estimation
-
-def estimate_noise_sigma(g):
-    """Robust noise std estimate from the image itself.  The diagonal Haar
-    detail d = (g[i,j] - g[i+1,j] - g[i,j+1] + g[i+1,j+1]) / 2 is mostly noise
-    (variance sigma^2 for white noise) and the median absolute deviation,
-    divided by 0.6745, is a robust estimate of a Gaussian std."""
-    d = (g[:-1, :-1] - g[1:, :-1] - g[:-1, 1:] + g[1:, 1:]) / 2
-    return np.median(np.abs(d - np.median(d))) / 0.6745
-
-
-def radial_frequency(shape):
-    """|omega| in cycles/pixel for every DFT bin, in fft2 (unshifted) order."""
-    u = np.fft.fftfreq(shape[0])[:, None]
-    v = np.fft.fftfreq(shape[1])[None, :]
-    return np.sqrt(u ** 2 + v ** 2)
-
-
-def smoothed_periodogram(g, width=5):
-    """Periodogram |G|^2/(MN) averaged over a width x width neighbourhood of
-    frequencies (circularly).  Averaging trades frequency resolution for a
-    lower variance; the raw periodogram has std equal to its mean."""
-    P = np.abs(np.fft.fft2(g - g.mean())) ** 2 / g.size
-    k = np.zeros_like(P)
-    r = width // 2
-    k[np.ix_(np.arange(-r, r + 1) % P.shape[0], np.arange(-r, r + 1) % P.shape[1])] = 1.0 / width ** 2
-    return np.real(np.fft.ifft2(np.fft.fft2(P) * np.fft.fft2(k)))
-
-
-def fit_power_law_spectrum(g, H, sigma, width=5):
-    """Fit the image PSD model S_f(rho) = A * rho^(-alpha) (natural-image prior)
-    to the degraded image, using the model S_g = |H|^2 S_f + sigma^2 and a
-    least-squares fit on the log of the smoothed periodogram.
-    Returns (A, alpha, S_f) with S_f evaluated on the DFT grid."""
-    from scipy.optimize import least_squares
-    rho = radial_frequency(g.shape)
-    Pg = smoothed_periodogram(g, width)
-    mask = rho > 2.0 / min(g.shape)              # skip DC and the lowest bins
-    H2, r, logP = np.abs(H[mask]) ** 2, rho[mask], np.log(Pg[mask])
-
-    def resid(p):
-        return np.log(H2 * np.exp(p[0]) * r ** (-p[1]) + sigma ** 2) - logP
-
-    p = least_squares(resid, x0=[np.log(Pg[mask].mean()), 2.0]).x
-    A, alpha = np.exp(p[0]), p[1]
-    S_f = A * np.maximum(rho, 1.0 / min(g.shape)) ** (-alpha)
-    return A, alpha, S_f
+def psnr(f, f_hat):
+    return 10 * np.log10(255 ** 2 / mse(f, f_hat))
