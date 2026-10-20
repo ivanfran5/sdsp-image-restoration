@@ -84,3 +84,52 @@ def mse(f, f_hat):
 
 def psnr(f, f_hat, peak=255.0):
     return 10 * np.log10(peak ** 2 / mse(f, f_hat))
+
+
+# ------------------------------------------------- blind parameter estimation
+
+def estimate_noise_sigma(g):
+    """Robust noise std estimate from the image itself.  The diagonal Haar
+    detail d = (g[i,j] - g[i+1,j] - g[i,j+1] + g[i+1,j+1]) / 2 is mostly noise
+    (variance sigma^2 for white noise) and the median absolute deviation,
+    divided by 0.6745, is a robust estimate of a Gaussian std."""
+    d = (g[:-1, :-1] - g[1:, :-1] - g[:-1, 1:] + g[1:, 1:]) / 2
+    return np.median(np.abs(d - np.median(d))) / 0.6745
+
+
+def radial_frequency(shape):
+    """|omega| in cycles/pixel for every DFT bin, in fft2 (unshifted) order."""
+    u = np.fft.fftfreq(shape[0])[:, None]
+    v = np.fft.fftfreq(shape[1])[None, :]
+    return np.sqrt(u ** 2 + v ** 2)
+
+
+def smoothed_periodogram(g, width=5):
+    """Periodogram |G|^2/(MN) averaged over a width x width neighbourhood of
+    frequencies (circularly).  Averaging trades frequency resolution for a
+    lower variance; the raw periodogram has std equal to its mean."""
+    P = np.abs(np.fft.fft2(g - g.mean())) ** 2 / g.size
+    k = np.zeros_like(P)
+    r = width // 2
+    k[np.ix_(np.arange(-r, r + 1) % P.shape[0], np.arange(-r, r + 1) % P.shape[1])] = 1.0 / width ** 2
+    return np.real(np.fft.ifft2(np.fft.fft2(P) * np.fft.fft2(k)))
+
+
+def fit_power_law_spectrum(g, H, sigma, width=5):
+    """Fit the image PSD model S_f(rho) = A * rho^(-alpha) (natural-image prior)
+    to the degraded image, using the model S_g = |H|^2 S_f + sigma^2 and a
+    least-squares fit on the log of the smoothed periodogram.
+    Returns (A, alpha, S_f) with S_f evaluated on the DFT grid."""
+    from scipy.optimize import least_squares
+    rho = radial_frequency(g.shape)
+    Pg = smoothed_periodogram(g, width)
+    mask = rho > 2.0 / min(g.shape)              # skip DC and the lowest bins
+    H2, r, logP = np.abs(H[mask]) ** 2, rho[mask], np.log(Pg[mask])
+
+    def resid(p):
+        return np.log(H2 * np.exp(p[0]) * r ** (-p[1]) + sigma ** 2) - logP
+
+    p = least_squares(resid, x0=[np.log(Pg[mask].mean()), 2.0]).x
+    A, alpha = np.exp(p[0]), p[1]
+    S_f = A * np.maximum(rho, 1.0 / min(g.shape)) ** (-alpha)
+    return A, alpha, S_f
