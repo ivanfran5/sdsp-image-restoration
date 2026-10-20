@@ -167,3 +167,33 @@ def mse(f, f_hat):
 
 def psnr(f, f_hat):
     return 10 * np.log10(255 ** 2 / mse(f, f_hat))
+
+
+# ------------------------------------------------------------------
+# Realistic (non-circular) blur and edge tapering
+# ------------------------------------------------------------------
+
+def blur_realistic(f, length, angle_deg, pad=30):
+    """Blur without wrap-around: extend the image by repeating its border
+    pixels, blur, and cut the original size back out."""
+    f_big = np.pad(f, pad, mode="edge")
+    H_big = np.fft.fft2(motion_psf(length, angle_deg, f_big.shape))
+    return blur(f_big, H_big)[pad:-pad, pad:-pad]
+
+
+def edge_window(n, width):
+    """1-D window: 1 in the middle, smooth cosine ramp from 0 to 1 over
+    `width` samples at both ends."""
+    w = np.ones(n)
+    for i in range(width):
+        value = 0.5 - 0.5 * np.cos(np.pi * (i + 0.5) / width)
+        w[i] = value
+        w[n - 1 - i] = value
+    return w
+
+
+def taper_edges(g, width):
+    """Fade the image smoothly to its mean value near the borders, so the
+    left/right and top/bottom edges match when the DFT wraps around."""
+    w = np.outer(edge_window(g.shape[0], width), edge_window(g.shape[1], width))
+    return w * g + (1 - w) * g.mean()
